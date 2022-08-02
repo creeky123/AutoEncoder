@@ -4,9 +4,9 @@ import pandas as pd
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
+from utils import *
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import normalize, minmax_scale
-import plotly.express as px
+from sklearn import preprocessing
 
 def normal_weight_init(layer):
     if isinstance(layer, nn.Linear):
@@ -102,6 +102,9 @@ class AutoencoderDataset(Dataset):
     def __init__(self, df:pd.DataFrame, normalize=False):
         super(AutoencoderDataset, self).__init__()
         self.data = torch.from_numpy(df.to_numpy())
+        if normalize:
+            self.scaler = preprocessing.MinMaxScaler().fit(self.data)
+            self.data = self.scaler.transform(self.data)
 
     def __len__(self):
         return len(self.data)
@@ -150,7 +153,19 @@ class AutoEncoder(nn.Module):
         x = self._decoder.forward(x)
         return x
 
-    def train_model(self, train_dataset, test_dataset, optimizer, lr_sched, batch_size, epochs, workers=1):
+    def extract_latent_representation(self, data, normalize=False):
+        ds = AutoencoderDataset(data,normalize)
+        dataloader = DataLoader(ds, batch_size=512, shuffle=False, num_workers=4)
+        output = []
+        for idx, batch in enumerate(dataloader):
+            batch = batch.float().to(self._device)
+            x = self.latent_representation(batch)
+            output.append(x.cpu().detach().numpy())
+
+        output = np.vstack(output)
+        return output
+
+    def train_model(self, train_dataset, test_dataset, optimizer, exp_lr_sched, lr_sched, batch_size, epochs, workers=1):
         self._optimizer = optimizer
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers)
         test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
@@ -165,6 +180,7 @@ class AutoEncoder(nn.Module):
 
             self.train(True)
             ## Training ##
+            idx = 0
             for idx, batch in enumerate(train_dataloader):
                 batch = batch.float().to(self._device)
                 out = self.encode_decode(batch)
@@ -178,6 +194,9 @@ class AutoEncoder(nn.Module):
 
             if lr_sched != None:
                 lr_sched.step(batch_loss)
+
+            if exp_lr_sched != None:
+                exp_lr_sched.step(i)
 
             ## Validation ##
             self.train(False)
@@ -203,9 +222,9 @@ def main():
     mean_1 = np.array([-1.0, -2.5, -3.4, 0.25, 2.3, 3.5, 2.0, 1.0, -3.0, 0.1])
     mean_2 = np.array([3.0, -0.5, -1.4, 2.25, -2.3, 0.11, .21, -3.0, 13.0, 0.45])
     mean_3 = np.array([-2.0, -5.5, 1.4, 3.25, .3, .5, 14.0, .24, 6.0, 0.21])
-    clust_1 = np.random.multivariate_normal(mean=mean_1, cov=np.eye(mean_1.shape[0])*3.0, size=500000, check_valid='warn', tol=1e-8)
-    clust_2 = np.random.multivariate_normal(mean=mean_2, cov=np.eye(mean_2.shape[0])*4.0, size=500000, check_valid='warn', tol=1e-8)
-    clust_3 = np.random.multivariate_normal(mean=mean_3, cov=np.eye(mean_3.shape[0])*5.0, size=500000, check_valid='warn', tol=1e-8)
+    clust_1 = np.random.multivariate_normal(mean=mean_1, cov=np.eye(mean_1.shape[0])*3.0, size=50000, check_valid='warn', tol=1e-8)
+    clust_2 = np.random.multivariate_normal(mean=mean_2, cov=np.eye(mean_2.shape[0])*4.0, size=50000, check_valid='warn', tol=1e-8)
+    clust_3 = np.random.multivariate_normal(mean=mean_3, cov=np.eye(mean_3.shape[0])*5.0, size=50000, check_valid='warn', tol=1e-8)
 
     combined = np.vstack([clust_1, clust_2, clust_3])
     df = pd.DataFrame(combined)
@@ -223,24 +242,55 @@ def main():
                        activation=nn.Tanh(),
                        loss_function=nn.MSELoss(),
                        initializer='normal',
-                       device=device
-                       )
+                       device=device)
     auto.to(device=device)
 
     #optimizer = torch.optim.SGD(auto.parameters(), lr=0.01, momentum=0.9)
     #optimizer = torch.optim.RMSprop(auto.parameters(), lr=1e-2, momentum=0.9)
     optimizer = torch.optim.Adam(auto.parameters(), lr=0.01)
-    #sched_1 = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
-    sched_2 = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, mode='min', verbose=True, factor=0.8)
+    exponential_lr_sched = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    lr_scheduler         = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, mode='min', verbose=True, factor=0.8)
 
     with_scheduler = auto.train_model(train_dataset=train_dataset,
                      test_dataset=test_dataset,
                      optimizer=optimizer,
-                     lr_sched=sched_2,
-                     batch_size=512,
-                     epochs=2,
+                     exp_lr_sched=exponential_lr_sched,
+                     lr_sched=lr_scheduler,
+                     batch_size=4048,
+                     epochs=20,
                      workers=1)
 
+    results_df = pd.DataFrame(with_scheduler)
+    results_df['Model'] = 'Schedulers'
+
+    auto1 = AutoEncoder(input_shape=mean_1.shape[0],
+                       latent_space_shape=3,
+                       depth=3,
+                       reduction_ratio=0.75,
+                       activation=nn.Tanh(),
+                       loss_function=nn.MSELoss(),
+                       initializer='normal',
+                       device=device)
+    auto1.to(device=device)
+
+    optimizer = torch.optim.Adam(auto1.parameters(), lr=0.01)
+    without_scheduler = auto1.train_model(train_dataset=train_dataset,
+                                      test_dataset=test_dataset,
+                                      optimizer=optimizer,
+                                      exp_lr_sched=None,
+                                      lr_sched=None,
+                                      batch_size=4048,
+                                      epochs=20,
+                                      workers=1)
+
+    df = pd.DataFrame(without_scheduler)
+    df['Model'] = 'WithoutSchedulers'
+    results_df = pd.concat([results_df, df], axis=0)
+
+    plot_results(df=results_df,
+                 column_to_plot='Validation Loss',
+                 index='Epoch',
+                 color='Model')
     a =12313
 
 
